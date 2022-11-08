@@ -4,66 +4,108 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
-	"os/signal"
 	"time"
 
 	_ "time/tzdata"
 
 	"github.com/go-ping/ping"
 	log "github.com/sirupsen/logrus"
+	"github.com/tcnksm/go-httpstat"
 )
 
 var (
-	logfile           *os.File
-	destinationDomain *string
-	interval          *int
-	debugFlg          *bool
-	globalIP          string
-	checkinFlag       = false
+	logfile *os.File
+	arg     = argument{}
 )
 
-type globIP struct {
-	Query string
+type argument struct {
+	Log               string
+	DestinationDomain string
+	Interval          int
+	DebugFlg          bool
 }
 
-func getGlobalip() (*string, error) {
-	req, err := http.Get("http://ip-api.com/json/")
-	if err != nil {
-		return nil, err
-	}
-	defer req.Body.Close()
-
-	body, err := ioutil.ReadAll(req.Body)
+func request() (*httpstat.Result, error) {
+	req, err := http.NewRequest("GET", "http://www.google.com/", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	var ip globIP
-	json.Unmarshal(body, &ip)
+	var result httpstat.Result
+	ctx := httpstat.WithHTTPStat(req.Context(), &result)
+	req = req.WithContext(ctx)
 
-	return &ip.Query, nil
+	client := http.DefaultClient
+	client.Timeout = time.Duration(5) * time.Second
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(ioutil.Discard, res.Body); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func newPinger() ping.Pinger {
+	pinger, err := ping.NewPinger(arg.DestinationDomain)
+	if err != nil {
+		log.Error(err)
+	}
+	log.Debug(fmt.Sprintf("PING %s (%s):", pinger.Addr(), pinger.IPAddr()))
+
+	pinger.Count = 5
+	pinger.Interval = time.Duration(arg.Interval) * time.Second
+	pinger.Timeout = time.Duration(arg.Interval*6) * time.Second
+
+	pinger.OnRecv = func(pkt *ping.Packet) {
+		s := fmt.Sprintf("%d bytes from %s: icmp_seq=%d time=%v", pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt)
+		log.Debug(s)
+	}
+
+	pinger.OnDuplicateRecv = func(pkt *ping.Packet) {
+		s := fmt.Sprintf("%d bytes from %s: icmp_seq=%d time=%v ttl=%v (DUP!)", pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt, pkt.Ttl)
+		log.Debug(s)
+	}
+
+	pinger.OnFinish = func(stats *ping.Statistics) {
+		log.Debug(fmt.Sprintf("%d packets transmitted, %d packets received, %v%% packet loss", stats.PacketsSent, stats.PacketsRecv, stats.PacketLoss))
+		log.Debug(fmt.Sprintf("round-trip min/avg/max/stddev = %v/%v/%v/%v", stats.MinRtt, stats.AvgRtt, stats.MaxRtt, stats.StdDevRtt))
+	}
+
+	return *pinger
+}
+
+func flags() {
+	a := flag.String("log", "pinger.log", "Output path of log.")
+	b := flag.String("dest", "www.google.com", "Destination domain.")
+	c := flag.Int("interval", 10, "Ping's interval.")
+	d := flag.Bool("v", false, "Verbose output somethings.")
+	flag.Parse()
+
+	arg.Log = *a
+	arg.DestinationDomain = *b
+	arg.Interval = *c
+	arg.DebugFlg = *d
 }
 
 func init() {
 	os.Setenv("TZ", "Asia/Tokyo")
-
-	logp := flag.String("log", "pinger.log", "Output path of log.")
-	destinationDomain = flag.String("dest", "www.google.com", "Destination domain.")
-	interval = flag.Int("interval", 3, "Ping's interval.")
-	debugFlg = flag.Bool("v", false, "Verbose output somethings.")
-	flag.Parse()
+	flags()
 
 	// open a file
-	f, err := os.OpenFile(*logp, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
-	logfile = f
+	f, err := os.OpenFile(arg.Log, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		log.Fatal(fmt.Sprintf("error opening file: %v", err))
 	}
+	logfile = f
 
-	if *debugFlg {
+	if arg.DebugFlg {
 		log.SetLevel(log.DebugLevel)
 	}
 	log.SetOutput(logfile)
@@ -71,71 +113,41 @@ func init() {
 }
 
 func main() {
+	j, _ := json.Marshal(arg)
+	log.Debugln(fmt.Sprintf("Arguments: %s", string(j)))
+
 	defer logfile.Close()
 
-	ip, err := getGlobalip()
+	log.Debug("Trying http request...")
+	_, err := request()
 	if err != nil {
-		log.Fatal("Failed to retrieve global IP: ", err)
-	} else {
-		globalIP = *ip
+		log.Fatal("Error while http requesting: ", err)
 	}
-	// HACK: not sure about interval value
-	lookupTim := time.NewTicker(time.Duration(*interval*6) * time.Second)
-	go func() {
-		for _ = range lookupTim.C {
-			if checkinFlag {
-				log.Warning("Other goroutine is working.")
-				return
-			}
+	log.Debug("Done http request")
 
-			checkinFlag = true
-			ip, err := getGlobalip()
-			if err != nil {
-				// Maybe do not go through here
-				log.Warning("Failed to retrieve global IP: ", err)
-			} else {
-				globalIP = *ip
-				log.Debug("Retrieved global IP: ", globalIP)
-			}
-			checkinFlag = false
+	pingTim := time.NewTicker(time.Duration(arg.Interval*6) * time.Second)
+	httpTim := time.NewTicker(time.Duration(arg.Interval*6) * time.Second)
+	for {
+		select {
+		case <-pingTim.C:
+			go func() {
+				log.Debug("Begining ping...")
+				p := newPinger()
+				err = p.Run()
+				if err != nil {
+					log.Fatal(err)
+				}
+			}()
+		case <-httpTim.C:
+			go func() {
+				log.Debug("Begining request of http...")
+
+				statRes, err := request()
+				if err != nil {
+					log.Error(err)
+				}
+				log.Info(fmt.Sprintf("%+v", statRes))
+			}()
 		}
-	}()
-
-	pinger, err := ping.NewPinger(*destinationDomain)
-	if err != nil {
-		panic(err)
-	}
-	pinger.Interval = time.Duration(*interval) * time.Second
-
-	// Listen for Ctrl-C.
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	go func() {
-		for _ = range c {
-			pinger.Stop()
-			lookupTim.Stop()
-		}
-	}()
-
-	pinger.OnRecv = func(pkt *ping.Packet) {
-		s := fmt.Sprintf("%d bytes dst %s, src %s: icmp_seq=%d time=%v", pkt.Nbytes, globalIP, pkt.IPAddr, pkt.Seq, pkt.Rtt)
-		log.Info(s)
-	}
-
-	pinger.OnDuplicateRecv = func(pkt *ping.Packet) {
-		s := fmt.Sprintf("%d bytes dst %s, src %s: icmp_seq=%d time=%v ttl=%v (DUP!)", pkt.Nbytes, globalIP, pkt.IPAddr, pkt.Seq, pkt.Rtt, pkt.Ttl)
-		log.Warn(s)
-	}
-
-	pinger.OnFinish = func(stats *ping.Statistics) {
-		log.Info(fmt.Sprintf("--- %s ping statistics ---", stats.Addr))
-		log.Info(fmt.Sprintf("%d packets transmitted, %d packets received, %v%% packet loss", stats.PacketsSent, stats.PacketsRecv, stats.PacketLoss))
-		log.Info(fmt.Sprintf("round-trip min/avg/max/stddev = %v/%v/%v/%v", stats.MinRtt, stats.AvgRtt, stats.MaxRtt, stats.StdDevRtt))
-	}
-
-	log.Info(fmt.Sprintf("PING %s (%s):", pinger.Addr(), pinger.IPAddr()))
-	err = pinger.Run()
-	if err != nil {
-		panic(err)
 	}
 }
